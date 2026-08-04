@@ -8,10 +8,11 @@ advertisers with [`react-native-ble-plx`](https://github.com/dotintent/react-nat
 The app:
 
 - requests the platform-specific Bluetooth permissions;
-- scans without a service UUID filter;
-- deduplicates devices by their platform identifier;
-- updates and sorts devices by RSSI signal strength; and
-- lets the user start and stop a continuous foreground scan.
+- runs a timed discovery scan without a service UUID filter;
+- keeps discovered devices in a stable first-seen order;
+- lets the user scan again without continuously rearranging the list; and
+- actively tracks a selected device with a live RSSI meter and numeric dBm
+  reading.
 
 ## Requirements
 

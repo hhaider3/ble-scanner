@@ -25,7 +25,7 @@ import {
 import { BleManager, Device, ScanMode, State } from 'react-native-ble-plx';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
-type NearbyDevice = {
+export type NearbyDevice = {
   id: string;
   isConnectable: boolean | null;
   lastSeen: number;
@@ -33,6 +33,15 @@ type NearbyDevice = {
   rssi: number | null;
   serviceCount: number;
 };
+
+type ScreenMode = 'devices' | 'finder';
+
+const DISCOVERY_DURATION_MS = 8_000;
+const SIGNAL_STALE_AFTER_MS = 5_000;
+const METER_SEGMENTS = 12;
+const RSSI_MIN = -100;
+const RSSI_MAX = -40;
+const RSSI_SMOOTHING_FACTOR = 0.3;
 
 const STATE_LABELS: Partial<Record<State, string>> = {
   [State.PoweredOn]: 'Bluetooth ready',
@@ -86,17 +95,73 @@ function normalizeDevice(device: Device): NearbyDevice {
   };
 }
 
+export function upsertDiscoveredDevice(
+  devices: NearbyDevice[],
+  incomingDevice: NearbyDevice,
+): NearbyDevice[] {
+  const existingIndex = devices.findIndex(
+    device => device.id === incomingDevice.id,
+  );
+
+  if (existingIndex === -1) {
+    return [...devices, incomingDevice];
+  }
+
+  const updatedDevices = [...devices];
+  updatedDevices[existingIndex] = incomingDevice;
+  return updatedDevices;
+}
+
+export function smoothRssi(
+  previousRssi: number | null,
+  incomingRssi: number,
+): number {
+  if (previousRssi === null) {
+    return incomingRssi;
+  }
+
+  return Math.round(
+    previousRssi * (1 - RSSI_SMOOTHING_FACTOR) +
+      incomingRssi * RSSI_SMOOTHING_FACTOR,
+  );
+}
+
+export function rssiToPercent(rssi: number | null): number {
+  if (rssi === null) {
+    return 0;
+  }
+
+  const clampedRssi = Math.min(RSSI_MAX, Math.max(RSSI_MIN, rssi));
+  return Math.round(((clampedRssi - RSSI_MIN) / (RSSI_MAX - RSSI_MIN)) * 100);
+}
+
 function signalDescription(rssi: number | null): string {
   if (rssi === null) {
-    return 'Signal unknown';
+    return 'No signal';
   }
-  if (rssi >= -60) {
-    return 'Strong signal';
+  if (rssi >= -55) {
+    return 'Very strong';
+  }
+  if (rssi >= -67) {
+    return 'Strong';
   }
   if (rssi >= -80) {
-    return 'Medium signal';
+    return 'Moderate';
   }
-  return 'Weak signal';
+  return 'Weak';
+}
+
+function signalColor(rssi: number | null): string {
+  if (rssi === null) {
+    return '#41606c';
+  }
+  if (rssi >= -67) {
+    return '#47d7ac';
+  }
+  if (rssi >= -80) {
+    return '#f2b862';
+  }
+  return '#ef7e72';
 }
 
 function bluetoothHelp(state: State): string {
@@ -115,9 +180,27 @@ function bluetoothHelp(state: State): string {
   }
 }
 
-function DeviceCard({ device }: { device: NearbyDevice }) {
+function DeviceCard({
+  device,
+  disabled,
+  onPress,
+}: {
+  device: NearbyDevice;
+  disabled: boolean;
+  onPress: () => void;
+}) {
   return (
-    <View style={styles.deviceCard}>
+    <Pressable
+      accessibilityLabel={`Track ${device.name}`}
+      accessibilityRole="button"
+      disabled={disabled}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.deviceCard,
+        pressed && styles.deviceCardPressed,
+        disabled && styles.deviceCardDisabled,
+      ]}
+    >
       <View style={styles.deviceTopRow}>
         <View style={styles.deviceTitleContainer}>
           <Text numberOfLines={1} style={styles.deviceName}>
@@ -150,6 +233,38 @@ function DeviceCard({ device }: { device: NearbyDevice }) {
           </>
         ) : null}
       </View>
+
+      <View style={styles.trackRow}>
+        <Text style={styles.trackHint}>
+          {disabled ? 'Available when scan finishes' : 'Track signal'}
+        </Text>
+        {!disabled ? <Text style={styles.trackArrow}>→</Text> : null}
+      </View>
+    </Pressable>
+  );
+}
+
+function SignalMeter({ rssi }: { rssi: number | null }) {
+  const activeSegments = Math.round(
+    (rssiToPercent(rssi) / 100) * METER_SEGMENTS,
+  );
+  const activeColor = signalColor(rssi);
+
+  return (
+    <View
+      accessibilityLabel={`Signal strength ${rssiToPercent(rssi)} percent`}
+      accessibilityRole="progressbar"
+      style={styles.meter}
+    >
+      {Array.from({ length: METER_SEGMENTS }, (_, index) => (
+        <View
+          key={index}
+          style={[
+            styles.meterSegment,
+            index < activeSegments && { backgroundColor: activeColor },
+          ]}
+        />
+      ))}
     </View>
   );
 }
@@ -157,38 +272,57 @@ function DeviceCard({ device }: { device: NearbyDevice }) {
 function ScannerScreen() {
   const manager = useMemo(() => new BleManager(), []);
   const scanSession = useRef(0);
+  const scanTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const initialScanStarted = useRef(false);
   const [adapterState, setAdapterState] = useState<State>(State.Unknown);
-  const [devices, setDevices] = useState<Record<string, NearbyDevice>>({});
+  const [devices, setDevices] = useState<NearbyDevice[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isScanning, setIsScanning] = useState(false);
+  const [hasScanned, setHasScanned] = useState(false);
+  const [isDiscovering, setIsDiscovering] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
-
-  const sortedDevices = useMemo(
-    () =>
-      Object.values(devices).sort(
-        (left, right) => (right.rssi ?? -200) - (left.rssi ?? -200),
-      ),
-    [devices],
+  const [isTracking, setIsTracking] = useState(false);
+  const [lastSignalAt, setLastSignalAt] = useState<number | null>(null);
+  const [liveRssi, setLiveRssi] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
+  const [screenMode, setScreenMode] = useState<ScreenMode>('devices');
+  const [selectedDevice, setSelectedDevice] = useState<NearbyDevice | null>(
+    null,
   );
 
-  const stopScan = useCallback(async () => {
+  const clearScanTimer = useCallback(() => {
+    if (scanTimer.current !== null) {
+      clearTimeout(scanTimer.current);
+      scanTimer.current = null;
+    }
+  }, []);
+
+  const stopNativeScan = useCallback(async () => {
     scanSession.current += 1;
-    setIsScanning(false);
+    clearScanTimer();
+    setIsDiscovering(false);
+    setIsTracking(false);
 
     try {
       await manager.stopDeviceScan();
     } catch {
-      // The native scan may already be stopped when Bluetooth changes state.
+      // The native scan can already be stopped after an adapter state change.
     }
-  }, [manager]);
+  }, [clearScanTimer, manager]);
 
-  const startScan = useCallback(async () => {
+  const startDiscoveryScan = useCallback(async () => {
     const currentSession = scanSession.current + 1;
     scanSession.current = currentSession;
+    clearScanTimer();
     setErrorMessage(null);
+    setIsDiscovering(false);
+    setIsTracking(false);
     setIsStarting(true);
+    setScreenMode('devices');
+    setSelectedDevice(null);
 
     try {
+      await manager.stopDeviceScan().catch(() => undefined);
+
       const hasPermission = await requestBluetoothPermissions();
       if (currentSession !== scanSession.current) {
         return;
@@ -212,8 +346,9 @@ function ScannerScreen() {
         return;
       }
 
-      setDevices({});
-      setIsScanning(true);
+      setDevices([]);
+      setHasScanned(true);
+      setIsDiscovering(true);
 
       await manager.startDeviceScan(
         null,
@@ -228,23 +363,36 @@ function ScannerScreen() {
 
           if (scanError) {
             scanSession.current += 1;
-            setIsScanning(false);
+            clearScanTimer();
+            setIsDiscovering(false);
             setErrorMessage(scanError.message || 'The BLE scan failed.');
             return;
           }
 
           if (device) {
-            const normalized = normalizeDevice(device);
-            setDevices(currentDevices => ({
-              ...currentDevices,
-              [normalized.id]: normalized,
-            }));
+            const normalizedDevice = normalizeDevice(device);
+            setDevices(currentDevices =>
+              upsertDiscoveredDevice(currentDevices, normalizedDevice),
+            );
           }
         },
       );
+
+      if (currentSession === scanSession.current) {
+        scanTimer.current = setTimeout(() => {
+          if (currentSession !== scanSession.current) {
+            return;
+          }
+
+          scanSession.current += 1;
+          scanTimer.current = null;
+          setIsDiscovering(false);
+          manager.stopDeviceScan().catch(() => undefined);
+        }, DISCOVERY_DURATION_MS);
+      }
     } catch (error) {
       if (currentSession === scanSession.current) {
-        setIsScanning(false);
+        setIsDiscovering(false);
         setErrorMessage(
           error instanceof Error
             ? error.message
@@ -256,7 +404,116 @@ function ScannerScreen() {
         setIsStarting(false);
       }
     }
-  }, [manager]);
+  }, [clearScanTimer, manager]);
+
+  const startTrackingDevice = useCallback(
+    async (target: NearbyDevice) => {
+      const currentSession = scanSession.current + 1;
+      scanSession.current = currentSession;
+      clearScanTimer();
+      setErrorMessage(null);
+      setIsDiscovering(false);
+      setIsTracking(false);
+      setIsStarting(true);
+      setLastSignalAt(null);
+      setLiveRssi(null);
+      setNow(Date.now());
+      setSelectedDevice(target);
+      setScreenMode('finder');
+
+      try {
+        await manager.stopDeviceScan().catch(() => undefined);
+
+        const hasPermission = await requestBluetoothPermissions();
+        if (currentSession !== scanSession.current) {
+          return;
+        }
+
+        if (!hasPermission) {
+          setErrorMessage(
+            'Bluetooth permission was denied. Allow it in Settings to track this device.',
+          );
+          return;
+        }
+
+        const currentState = await manager.state();
+        if (currentSession !== scanSession.current) {
+          return;
+        }
+
+        setAdapterState(currentState);
+        if (currentState !== State.PoweredOn) {
+          setErrorMessage(bluetoothHelp(currentState));
+          return;
+        }
+
+        setIsTracking(true);
+
+        await manager.startDeviceScan(
+          null,
+          {
+            allowDuplicates: true,
+            scanMode: ScanMode.LowLatency,
+          },
+          (scanError, device) => {
+            if (currentSession !== scanSession.current) {
+              return;
+            }
+
+            if (scanError) {
+              scanSession.current += 1;
+              setIsTracking(false);
+              setErrorMessage(
+                scanError.message || 'The device tracking scan failed.',
+              );
+              return;
+            }
+
+            if (device?.id !== target.id || device.rssi === null) {
+              return;
+            }
+
+            const observedAt = Date.now();
+            setNow(observedAt);
+            setLastSignalAt(observedAt);
+            setLiveRssi(currentRssi => smoothRssi(currentRssi, device.rssi!));
+          },
+        );
+      } catch (error) {
+        if (currentSession === scanSession.current) {
+          setIsTracking(false);
+          setErrorMessage(
+            error instanceof Error
+              ? error.message
+              : 'Could not start tracking this device.',
+          );
+        }
+      } finally {
+        if (currentSession === scanSession.current) {
+          setIsStarting(false);
+        }
+      }
+    },
+    [clearScanTimer, manager],
+  );
+
+  const returnToDevices = useCallback(async () => {
+    await stopNativeScan();
+    setErrorMessage(null);
+    setLastSignalAt(null);
+    setLiveRssi(null);
+    setSelectedDevice(null);
+    setScreenMode('devices');
+  }, [stopNativeScan]);
+
+  useEffect(() => {
+    if (screenMode !== 'finder' || !isTracking) {
+      return undefined;
+    }
+
+    const interval = setInterval(() => setNow(Date.now()), 1_000);
+    return () => clearInterval(interval);
+  }, [isTracking, screenMode]);
 
   useEffect(() => {
     let isMounted = true;
@@ -266,15 +523,27 @@ function ScannerScreen() {
       }
 
       setAdapterState(nextState);
+
+      if (nextState === State.PoweredOn && !initialScanStarted.current) {
+        initialScanStarted.current = true;
+        startDiscoveryScan().catch(() => undefined);
+        return;
+      }
+
       if (nextState !== State.PoweredOn) {
         scanSession.current += 1;
-        setIsScanning(false);
+        clearScanTimer();
+        setIsDiscovering(false);
+        setIsTracking(false);
+        setErrorMessage(bluetoothHelp(nextState));
+        manager.stopDeviceScan().catch(() => undefined);
       }
     }, true);
 
     return () => {
       isMounted = false;
       scanSession.current += 1;
+      clearScanTimer();
       subscription.remove();
       manager
         .stopDeviceScan()
@@ -283,10 +552,133 @@ function ScannerScreen() {
           // The manager can already be torn down during development reloads.
         });
     };
-  }, [manager]);
+  }, [clearScanTimer, manager, startDiscoveryScan]);
 
-  const statusLabel = isScanning
-    ? 'Scanning nearby'
+  const signalAge = lastSignalAt === null ? null : now - lastSignalAt;
+  const isSignalStale = signalAge !== null && signalAge > SIGNAL_STALE_AFTER_MS;
+  const displayedRssi = isSignalStale ? null : liveRssi;
+
+  if (screenMode === 'finder' && selectedDevice) {
+    return (
+      <SafeAreaView edges={['top', 'bottom']} style={styles.safeArea}>
+        <StatusBar barStyle="light-content" backgroundColor="#071b27" />
+
+        <View style={styles.finderHeader}>
+          <Pressable
+            accessibilityLabel="Back to discovered devices"
+            accessibilityRole="button"
+            onPress={returnToDevices}
+            style={({ pressed }) => [
+              styles.backButton,
+              pressed && styles.buttonPressed,
+            ]}
+          >
+            <Text style={styles.backButtonText}>← Devices</Text>
+          </Pressable>
+          <Text style={styles.eyebrow}>LIVE SIGNAL</Text>
+          <Text numberOfLines={1} style={styles.finderTitle}>
+            {selectedDevice.name}
+          </Text>
+          <Text numberOfLines={1} style={styles.finderDeviceId}>
+            {selectedDevice.id}
+          </Text>
+        </View>
+
+        <View style={styles.finderBody}>
+          <View style={styles.signalCard}>
+            <View style={styles.liveStatusRow}>
+              <View
+                style={[
+                  styles.statusDot,
+                  displayedRssi === null
+                    ? styles.statusMuted
+                    : styles.statusReady,
+                ]}
+              />
+              <Text style={styles.liveStatusText}>
+                {isStarting
+                  ? 'Starting tracker'
+                  : isSignalStale
+                  ? 'Signal lost — keep moving'
+                  : displayedRssi === null
+                  ? 'Waiting for this device'
+                  : 'Receiving live signal'}
+              </Text>
+              {isTracking ? (
+                <ActivityIndicator color="#47d7ac" size="small" />
+              ) : null}
+            </View>
+
+            <View style={styles.readingRow}>
+              <Text
+                accessibilityLabel={
+                  displayedRssi === null
+                    ? 'No current RSSI reading'
+                    : `Current RSSI ${displayedRssi} decibels`
+                }
+                style={[
+                  styles.readingNumber,
+                  { color: signalColor(displayedRssi) },
+                ]}
+              >
+                {displayedRssi === null ? '—' : displayedRssi}
+              </Text>
+              <View style={styles.readingLabels}>
+                <Text style={styles.readingUnit}>dBm</Text>
+                <Text style={styles.readingDescription}>
+                  {signalDescription(displayedRssi)}
+                </Text>
+              </View>
+            </View>
+
+            <SignalMeter rssi={displayedRssi} />
+            <View style={styles.meterLabels}>
+              <Text style={styles.meterLabel}>Weak</Text>
+              <Text style={styles.meterLabel}>Moderate</Text>
+              <Text style={styles.meterLabel}>Strong</Text>
+            </View>
+
+            {isSignalStale && liveRssi !== null && signalAge !== null ? (
+              <Text style={styles.lastReadingText}>
+                Last reading: {liveRssi} dBm, {Math.floor(signalAge / 1_000)}s
+                ago
+              </Text>
+            ) : null}
+
+            {errorMessage ? (
+              <Text accessibilityRole="alert" style={styles.errorText}>
+                {errorMessage}
+              </Text>
+            ) : null}
+          </View>
+
+          <View style={styles.finderTipCard}>
+            <Text style={styles.tipTitle}>Find it faster</Text>
+            <Text style={styles.tipText}>
+              Walk slowly and watch the meter. A less negative number means the
+              signal is getting stronger and you are likely moving closer.
+            </Text>
+          </View>
+
+          <Pressable
+            accessibilityRole="button"
+            onPress={returnToDevices}
+            style={({ pressed }) => [
+              styles.secondaryButton,
+              pressed && styles.buttonPressed,
+            ]}
+          >
+            <Text style={styles.secondaryButtonText}>Stop tracking</Text>
+          </Pressable>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  const statusLabel = isDiscovering
+    ? 'Scanning nearby for 8 seconds'
+    : hasScanned
+    ? 'Scan complete — list is frozen'
     : STATE_LABELS[adapterState] ?? 'Bluetooth unavailable';
   const statusColor =
     adapterState === State.PoweredOn ? styles.statusReady : styles.statusMuted;
@@ -299,7 +691,7 @@ function ScannerScreen() {
         <Text style={styles.eyebrow}>BLUETOOTH LOW ENERGY</Text>
         <Text style={styles.title}>Nearby devices</Text>
         <Text style={styles.subtitle}>
-          Find BLE accessories advertising around this phone.
+          Scan once, choose a device, then track its live signal strength.
         </Text>
       </View>
 
@@ -307,37 +699,29 @@ function ScannerScreen() {
         <View style={styles.statusRow}>
           <View style={[styles.statusDot, statusColor]} />
           <Text style={styles.statusText}>{statusLabel}</Text>
-          {isScanning ? (
+          {isDiscovering || isStarting ? (
             <ActivityIndicator color="#47d7ac" size="small" />
           ) : null}
         </View>
 
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={
-            isScanning ? 'Stop scanning' : 'Scan for nearby devices'
-          }
-          disabled={isStarting}
-          onPress={isScanning ? stopScan : startScan}
+          accessibilityLabel={hasScanned ? 'Scan again' : 'Scan for devices'}
+          disabled={isDiscovering || isStarting}
+          onPress={startDiscoveryScan}
           style={({ pressed }) => [
             styles.scanButton,
-            isScanning && styles.stopButton,
             pressed && styles.buttonPressed,
-            isStarting && styles.buttonDisabled,
+            (isDiscovering || isStarting) && styles.buttonDisabled,
           ]}
         >
-          {isStarting ? (
-            <ActivityIndicator color="#071b27" />
-          ) : (
-            <Text
-              style={[
-                styles.scanButtonText,
-                isScanning && styles.stopButtonText,
-              ]}
-            >
-              {isScanning ? 'Stop scan' : 'Scan for devices'}
-            </Text>
-          )}
+          <Text style={styles.scanButtonText}>
+            {isDiscovering || isStarting
+              ? 'Scanning…'
+              : hasScanned
+              ? 'Scan again'
+              : 'Scan for devices'}
+          </Text>
         </Pressable>
 
         {errorMessage ? (
@@ -350,30 +734,37 @@ function ScannerScreen() {
       <View style={styles.listHeader}>
         <Text style={styles.listTitle}>Discovered</Text>
         <Text style={styles.deviceCount}>
-          {sortedDevices.length}{' '}
-          {sortedDevices.length === 1 ? 'device' : 'devices'}
+          {devices.length} {devices.length === 1 ? 'device' : 'devices'}
         </Text>
       </View>
 
       <FlatList
         contentContainerStyle={[
           styles.listContent,
-          sortedDevices.length === 0 && styles.emptyListContent,
+          devices.length === 0 && styles.emptyListContent,
         ]}
-        data={sortedDevices}
+        data={devices}
         keyExtractor={device => device.id}
-        renderItem={({ item }) => <DeviceCard device={item} />}
+        renderItem={({ item }) => (
+          <DeviceCard
+            device={item}
+            disabled={isDiscovering || isStarting}
+            onPress={() => startTrackingDevice(item)}
+          />
+        )}
         ListEmptyComponent={
           <View style={styles.emptyState}>
             <View style={styles.bluetoothMark}>
               <Text style={styles.bluetoothMarkText}>B</Text>
             </View>
             <Text style={styles.emptyTitle}>
-              {isScanning ? 'Listening for advertisements…' : 'Ready to scan'}
+              {isDiscovering
+                ? 'Listening for advertisements…'
+                : 'Ready to scan'}
             </Text>
             <Text style={styles.emptyText}>
-              {isScanning
-                ? 'Keep nearby accessories powered on and in pairing mode.'
+              {isDiscovering
+                ? 'Results will become selectable when this scan finishes.'
                 : bluetoothHelp(adapterState)}
             </Text>
           </View>
@@ -402,8 +793,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   header: {
-    paddingHorizontal: 22,
     paddingBottom: 20,
+    paddingHorizontal: 22,
     paddingTop: 18,
   },
   eyebrow: {
@@ -424,7 +815,7 @@ const styles = StyleSheet.create({
     fontSize: 15,
     lineHeight: 22,
     marginTop: 8,
-    maxWidth: 330,
+    maxWidth: 350,
   },
   controlCard: {
     backgroundColor: '#102c39',
@@ -465,11 +856,6 @@ const styles = StyleSheet.create({
     height: 48,
     justifyContent: 'center',
   },
-  stopButton: {
-    backgroundColor: 'transparent',
-    borderColor: '#47d7ac',
-    borderWidth: 1,
-  },
   buttonPressed: {
     opacity: 0.76,
   },
@@ -480,9 +866,6 @@ const styles = StyleSheet.create({
     color: '#071b27',
     fontSize: 15,
     fontWeight: '800',
-  },
-  stopButtonText: {
-    color: '#66e4bd',
   },
   errorText: {
     color: '#ffb5ad',
@@ -522,6 +905,13 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     marginBottom: 10,
     padding: 15,
+  },
+  deviceCardPressed: {
+    borderColor: '#47d7ac',
+    transform: [{ scale: 0.99 }],
+  },
+  deviceCardDisabled: {
+    opacity: 0.72,
   },
   deviceTopRow: {
     alignItems: 'flex-start',
@@ -566,6 +956,24 @@ const styles = StyleSheet.create({
     color: '#3c5c68',
     marginHorizontal: 7,
   },
+  trackRow: {
+    alignItems: 'center',
+    borderTopColor: '#173b49',
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 13,
+    paddingTop: 11,
+  },
+  trackHint: {
+    color: '#70d8b8',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  trackArrow: {
+    color: '#70d8b8',
+    fontSize: 17,
+  },
   emptyState: {
     alignItems: 'center',
     flex: 1,
@@ -608,6 +1016,141 @@ const styles = StyleSheet.create({
     paddingBottom: 5,
     paddingHorizontal: 22,
     textAlign: 'center',
+  },
+  finderHeader: {
+    paddingBottom: 22,
+    paddingHorizontal: 22,
+    paddingTop: 10,
+  },
+  backButton: {
+    alignSelf: 'flex-start',
+    marginBottom: 22,
+    paddingVertical: 6,
+  },
+  backButtonText: {
+    color: '#83e8c7',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  finderTitle: {
+    color: '#f5fbff',
+    fontSize: 30,
+    fontWeight: '800',
+    letterSpacing: -0.5,
+  },
+  finderDeviceId: {
+    color: '#718d9a',
+    fontSize: 12,
+    marginTop: 7,
+  },
+  finderBody: {
+    flex: 1,
+    paddingHorizontal: 18,
+  },
+  signalCard: {
+    backgroundColor: '#102c39',
+    borderColor: '#1c4250',
+    borderRadius: 20,
+    borderWidth: 1,
+    padding: 20,
+  },
+  liveStatusRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    minHeight: 22,
+  },
+  liveStatusText: {
+    color: '#dceaf0',
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  readingRow: {
+    alignItems: 'flex-end',
+    flexDirection: 'row',
+    marginBottom: 24,
+    marginTop: 26,
+  },
+  readingNumber: {
+    fontSize: 70,
+    fontVariant: ['tabular-nums'],
+    fontWeight: '800',
+    letterSpacing: -3,
+    lineHeight: 76,
+  },
+  readingLabels: {
+    marginBottom: 9,
+    marginLeft: 12,
+  },
+  readingUnit: {
+    color: '#91a8b3',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  readingDescription: {
+    color: '#dceaf0',
+    fontSize: 14,
+    fontWeight: '800',
+    marginTop: 4,
+  },
+  meter: {
+    flexDirection: 'row',
+    height: 30,
+  },
+  meterSegment: {
+    backgroundColor: '#264653',
+    borderRadius: 4,
+    flex: 1,
+    marginRight: 4,
+  },
+  meterLabels: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 9,
+  },
+  meterLabel: {
+    color: '#708a95',
+    fontSize: 10,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+  },
+  lastReadingText: {
+    color: '#f2b862',
+    fontSize: 12,
+    marginTop: 18,
+  },
+  finderTipCard: {
+    backgroundColor: '#0d2632',
+    borderColor: '#173b49',
+    borderRadius: 15,
+    borderWidth: 1,
+    marginTop: 14,
+    padding: 16,
+  },
+  tipTitle: {
+    color: '#dceaf0',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  tipText: {
+    color: '#829aa6',
+    fontSize: 13,
+    lineHeight: 20,
+    marginTop: 6,
+  },
+  secondaryButton: {
+    alignItems: 'center',
+    borderColor: '#47d7ac',
+    borderRadius: 12,
+    borderWidth: 1,
+    height: 48,
+    justifyContent: 'center',
+    marginTop: 18,
+  },
+  secondaryButtonText: {
+    color: '#66e4bd',
+    fontSize: 14,
+    fontWeight: '800',
   },
 });
 

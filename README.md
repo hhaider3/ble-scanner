@@ -1,3 +1,5 @@
+![NearbyBluetooth scanning for wireless earbuds](docs/ble-scanner-header.png)
+
 # NearbyBluetooth
 
 A basic React Native app that scans for nearby Bluetooth Low Energy (BLE)

@@ -13,7 +13,10 @@ import React, {
 } from 'react';
 import {
   ActivityIndicator,
+  BackHandler,
+  DeviceEventEmitter,
   FlatList,
+  NativeModules,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -26,12 +29,28 @@ import { BleManager, Device, ScanMode, State } from 'react-native-ble-plx';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 export type NearbyDevice = {
+  canTrack: boolean;
   id: string;
+  isBonded: boolean;
+  isConnected: boolean;
   isConnectable: boolean | null;
   lastSeen: number;
   name: string;
   rssi: number | null;
   serviceCount: number;
+};
+
+type SystemAudioDevice = {
+  id: string;
+  isBonded: boolean;
+  isConnected: boolean;
+  name: string;
+  profiles: string[];
+};
+
+type BluetoothSystemModule = {
+  getKnownAudioDevices: () => Promise<SystemAudioDevice[]>;
+  setFinderBackHandlerEnabled?: (enabled: boolean) => void;
 };
 
 type ScreenMode = 'devices' | 'finder';
@@ -42,6 +61,10 @@ const METER_SEGMENTS = 12;
 const RSSI_MIN = -100;
 const RSSI_MAX = -40;
 const RSSI_SMOOTHING_FACTOR = 0.3;
+
+const bluetoothSystem = NativeModules.BluetoothSystem as
+  | BluetoothSystemModule
+  | undefined;
 
 const STATE_LABELS: Partial<Record<State, string>> = {
   [State.PoweredOn]: 'Bluetooth ready',
@@ -86,13 +109,46 @@ async function requestBluetoothPermissions(): Promise<boolean> {
 
 function normalizeDevice(device: Device): NearbyDevice {
   return {
+    canTrack: true,
     id: device.id,
+    isBonded: false,
+    isConnected: false,
     isConnectable: device.isConnectable,
     lastSeen: Date.now(),
     name: device.localName || device.name || 'Unnamed device',
     rssi: device.rssi,
     serviceCount: device.serviceUUIDs?.length ?? 0,
   };
+}
+
+function normalizeSystemAudioDevice(
+  device: SystemAudioDevice,
+): NearbyDevice {
+  return {
+    canTrack: false,
+    id: device.id,
+    isBonded: device.isBonded,
+    isConnected: device.isConnected,
+    isConnectable: null,
+    lastSeen: Date.now(),
+    name: device.name || 'Audio device',
+    rssi: null,
+    serviceCount: 0,
+  };
+}
+
+async function getKnownAudioDevices(): Promise<NearbyDevice[]> {
+  if (Platform.OS !== 'android' || !bluetoothSystem) {
+    return [];
+  }
+
+  try {
+    const devices = await bluetoothSystem.getKnownAudioDevices();
+    return devices.map(normalizeSystemAudioDevice);
+  } catch {
+    // BLE discovery should still work if a phone cannot expose audio profiles.
+    return [];
+  }
 }
 
 export function upsertDiscoveredDevice(
@@ -107,8 +163,19 @@ export function upsertDiscoveredDevice(
     return [...devices, incomingDevice];
   }
 
+  const existingDevice = devices[existingIndex];
   const updatedDevices = [...devices];
-  updatedDevices[existingIndex] = incomingDevice;
+  updatedDevices[existingIndex] = {
+    ...existingDevice,
+    ...incomingDevice,
+    canTrack: existingDevice.canTrack || incomingDevice.canTrack,
+    isBonded: existingDevice.isBonded || incomingDevice.isBonded,
+    isConnected: existingDevice.isConnected || incomingDevice.isConnected,
+    name:
+      incomingDevice.name === 'Unnamed device'
+        ? existingDevice.name
+        : incomingDevice.name,
+  };
   return updatedDevices;
 }
 
@@ -189,16 +256,23 @@ function DeviceCard({
   disabled: boolean;
   onPress: () => void;
 }) {
+  const canTrackNow = device.canTrack && !disabled;
+
   return (
     <Pressable
-      accessibilityLabel={`Track ${device.name}`}
+      accessibilityLabel={
+        device.canTrack
+          ? `Track ${device.name}`
+          : `${device.name}, live BLE tracking unavailable`
+      }
       accessibilityRole="button"
-      disabled={disabled}
+      disabled={!canTrackNow}
       onPress={onPress}
       style={({ pressed }) => [
         styles.deviceCard,
         pressed && styles.deviceCardPressed,
         disabled && styles.deviceCardDisabled,
+        !device.canTrack && styles.systemDeviceCard,
       ]}
     >
       <View style={styles.deviceTopRow}>
@@ -218,11 +292,32 @@ function DeviceCard({
       </View>
 
       <View style={styles.deviceMetaRow}>
-        <Text style={styles.deviceMeta}>{signalDescription(device.rssi)}</Text>
-        <Text style={styles.metaDivider}>•</Text>
+        {device.isConnected || device.isBonded ? (
+          <>
+            <Text
+              style={[
+                styles.deviceStatus,
+                device.isConnected
+                  ? styles.deviceStatusConnected
+                  : styles.deviceStatusPaired,
+              ]}
+            >
+              {device.isConnected ? 'Connected' : 'Paired'}
+            </Text>
+            <Text style={styles.metaDivider}>•</Text>
+          </>
+        ) : null}
         <Text style={styles.deviceMeta}>
-          {device.isConnectable === false ? 'Advertising' : 'Connectable'}
+          {device.canTrack ? signalDescription(device.rssi) : 'System audio'}
         </Text>
+        {device.canTrack ? (
+          <>
+            <Text style={styles.metaDivider}>•</Text>
+            <Text style={styles.deviceMeta}>
+              {device.isConnectable === false ? 'Advertising' : 'Connectable'}
+            </Text>
+          </>
+        ) : null}
         {device.serviceCount > 0 ? (
           <>
             <Text style={styles.metaDivider}>•</Text>
@@ -236,9 +331,13 @@ function DeviceCard({
 
       <View style={styles.trackRow}>
         <Text style={styles.trackHint}>
-          {disabled ? 'Available when scan finishes' : 'Track signal'}
+          {disabled
+            ? 'Available when scan finishes'
+            : device.canTrack
+            ? 'Track BLE signal'
+            : 'Live BLE signal unavailable'}
         </Text>
-        {!disabled ? <Text style={styles.trackArrow}>→</Text> : null}
+        {canTrackNow ? <Text style={styles.trackArrow}>→</Text> : null}
       </View>
     </Pressable>
   );
@@ -346,7 +445,12 @@ function ScannerScreen() {
         return;
       }
 
-      setDevices([]);
+      const knownAudioDevices = await getKnownAudioDevices();
+      if (currentSession !== scanSession.current) {
+        return;
+      }
+
+      setDevices(knownAudioDevices);
       setHasScanned(true);
       setIsDiscovering(true);
 
@@ -408,6 +512,10 @@ function ScannerScreen() {
 
   const startTrackingDevice = useCallback(
     async (target: NearbyDevice) => {
+      if (!target.canTrack) {
+        return;
+      }
+
       const currentSession = scanSession.current + 1;
       scanSession.current = currentSession;
       clearScanTimer();
@@ -505,6 +613,42 @@ function ScannerScreen() {
     setSelectedDevice(null);
     setScreenMode('devices');
   }, [stopNativeScan]);
+
+  useEffect(() => {
+    if (screenMode !== 'finder') {
+      return undefined;
+    }
+
+    const handleBack = () => {
+      returnToDevices().catch(() => undefined);
+    };
+
+    if (
+      Platform.OS === 'android' &&
+      bluetoothSystem?.setFinderBackHandlerEnabled
+    ) {
+      const subscription = DeviceEventEmitter.addListener(
+        'finderBackRequested',
+        handleBack,
+      );
+      bluetoothSystem.setFinderBackHandlerEnabled(true);
+
+      return () => {
+        bluetoothSystem.setFinderBackHandlerEnabled?.(false);
+        subscription.remove();
+      };
+    }
+
+    const subscription = BackHandler.addEventListener(
+      'hardwareBackPress',
+      () => {
+        handleBack();
+        return true;
+      },
+    );
+
+    return () => subscription.remove();
+  }, [returnToDevices, screenMode]);
 
   useEffect(() => {
     if (screenMode !== 'finder' || !isTracking) {
@@ -688,10 +832,11 @@ function ScannerScreen() {
       <StatusBar barStyle="light-content" backgroundColor="#071b27" />
 
       <View style={styles.header}>
-        <Text style={styles.eyebrow}>BLUETOOTH LOW ENERGY</Text>
+        <Text style={styles.eyebrow}>BLUETOOTH DEVICE FINDER</Text>
         <Text style={styles.title}>Nearby devices</Text>
         <Text style={styles.subtitle}>
-          Scan once, choose a device, then track its live signal strength.
+          See connected audio devices and nearby BLE advertisers, then track an
+          available BLE signal.
         </Text>
       </View>
 
@@ -732,7 +877,7 @@ function ScannerScreen() {
       </View>
 
       <View style={styles.listHeader}>
-        <Text style={styles.listTitle}>Discovered</Text>
+        <Text style={styles.listTitle}>Known devices</Text>
         <Text style={styles.deviceCount}>
           {devices.length} {devices.length === 1 ? 'device' : 'devices'}
         </Text>
@@ -773,7 +918,8 @@ function ScannerScreen() {
       />
 
       <Text style={styles.footerNote}>
-        Results include BLE advertisers only, not Bluetooth Classic devices.
+        Connected audio devices can be listed, but live tracking requires a BLE
+        advertisement from that device.
       </Text>
     </SafeAreaView>
   );
@@ -913,6 +1059,9 @@ const styles = StyleSheet.create({
   deviceCardDisabled: {
     opacity: 0.72,
   },
+  systemDeviceCard: {
+    borderColor: '#35505b',
+  },
   deviceTopRow: {
     alignItems: 'flex-start',
     flexDirection: 'row',
@@ -951,6 +1100,23 @@ const styles = StyleSheet.create({
   deviceMeta: {
     color: '#a8bac3',
     fontSize: 12,
+  },
+  deviceStatus: {
+    borderRadius: 10,
+    fontSize: 10,
+    fontWeight: '800',
+    overflow: 'hidden',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    textTransform: 'uppercase',
+  },
+  deviceStatusConnected: {
+    backgroundColor: '#17483c',
+    color: '#83e8c7',
+  },
+  deviceStatusPaired: {
+    backgroundColor: '#30414a',
+    color: '#bccbd2',
   },
   metaDivider: {
     color: '#3c5c68',

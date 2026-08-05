@@ -8,11 +8,17 @@ advertisers with [`react-native-ble-plx`](https://github.com/dotintent/react-nat
 The app:
 
 - requests the platform-specific Bluetooth permissions;
+- includes connected and paired Android audio devices using the system A2DP and
+  headset profiles;
 - runs a timed discovery scan without a service UUID filter;
 - keeps discovered devices in a stable first-seen order;
 - lets the user scan again without continuously rearranging the list; and
 - actively tracks a selected device with a live RSSI meter and numeric dBm
   reading.
+
+Connected or paired Bluetooth Classic audio devices are visible in the list,
+but Android does not expose a live RSSI feed for those profiles. Signal tracking
+is enabled only when the device is also observed advertising over BLE.
 
 ## Requirements
 

@@ -57,7 +57,10 @@ test('renders the nearby device scanner', async () => {
 
 test('updates a discovered device without changing list order', () => {
   const firstDevice: NearbyDevice = {
+    canTrack: true,
     id: 'first',
+    isBonded: false,
+    isConnected: false,
     isConnectable: true,
     lastSeen: 1,
     name: 'First device',
@@ -65,7 +68,10 @@ test('updates a discovered device without changing list order', () => {
     serviceCount: 0,
   };
   const secondDevice: NearbyDevice = {
+    canTrack: true,
     id: 'second',
+    isBonded: false,
+    isConnected: false,
     isConnectable: true,
     lastSeen: 2,
     name: 'Second device',
@@ -85,6 +91,41 @@ test('updates a discovered device without changing list order', () => {
 
   expect(updated.map(device => device.id)).toEqual(['first', 'second']);
   expect(updated[0].rssi).toBe(-40);
+});
+
+test('merges a BLE sighting into a connected system audio device', () => {
+  const connectedHeadphones: NearbyDevice = {
+    canTrack: false,
+    id: 'AA:BB:CC:DD:EE:FF',
+    isBonded: true,
+    isConnected: true,
+    isConnectable: null,
+    lastSeen: 1,
+    name: 'Headphones',
+    rssi: null,
+    serviceCount: 0,
+  };
+
+  const updated = upsertDiscoveredDevice([connectedHeadphones], {
+    canTrack: true,
+    id: connectedHeadphones.id,
+    isBonded: false,
+    isConnected: false,
+    isConnectable: true,
+    lastSeen: 2,
+    name: 'Unnamed device',
+    rssi: -61,
+    serviceCount: 2,
+  });
+
+  expect(updated).toHaveLength(1);
+  expect(updated[0]).toMatchObject({
+    canTrack: true,
+    isBonded: true,
+    isConnected: true,
+    name: 'Headphones',
+    rssi: -61,
+  });
 });
 
 test('smooths RSSI readings and maps them onto the strength meter', () => {
